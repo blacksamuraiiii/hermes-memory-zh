@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+*.db
+*.db-wal
+*.db-shm
+snapshots/
+
+# local environment backup (not for public repo)
+docs/config.before-switch.yaml
+docs/config.*.yaml
+
+.pytest_cache/

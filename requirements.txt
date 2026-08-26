@@ -1,0 +1,7 @@
+# hermes-memory-zh runtime dependencies
+# jieba is REQUIRED for Chinese tokenization (falls back to unicode61 without it).
+jieba>=0.42
+# openai is optional — only needed when embedding is enabled (any OpenAI-compatible gateway).
+openai>=1.0
+# numpy is optional — HRR + vector ops fall back gracefully without it.
+numpy

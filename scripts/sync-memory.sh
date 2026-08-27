@@ -30,6 +30,8 @@ cmd="${1:-pull}"
 case "$cmd" in
   push)
     if [ ! -f "$DB" ]; then echo "no DB at $DB"; exit 0; fi
+    # 记录生成快照前的基准（否则生成后它就是"最新"，永远和自己比、永远 skip）
+    prev_snap="$(latest_snap)"
     ts="$(date -u +%Y%m%dT%H%M%SZ)"
     snap="$SNAP_DIR/snap-$ts.db"
     # 一致性快照（含 WAL 未 checkpoint 的数据）。用 python 标准库 sqlite3，
@@ -41,6 +43,14 @@ src.backup(dst); dst.close(); src.close()
 print("backup ok:", len(open(sys.argv[2],'rb').read()), "bytes")
 PY
     echo "snapshot: $(basename "$snap")"
+    # md5 去重：若内容与生成前的基准快照一致，说明记忆库未变化，
+    # 删除刚生成的临时快照并跳过上传（避免每次 push 都产生重复 blob）。
+    new_md5="$(md5sum "$snap" | cut -d' ' -f1)"
+    if [ -n "$prev_snap" ] && [ "$(md5sum "$prev_snap" | cut -d' ' -f1)" = "$new_md5" ]; then
+      echo "snapshot unchanged (md5 $new_md5) — skip upload"
+      rm -f "$snap"
+      exit 0
+    fi
     # 清理超期快照文件
     find "$SNAP_DIR" -name 'snap-*.db' -mtime +"$RETENTION_DAYS" -delete
     ( cd "$REPO" && git add snapshots/ && \

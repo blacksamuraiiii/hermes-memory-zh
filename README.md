@@ -1,5 +1,13 @@
 # hermes-memory-zh
 
+<p>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-4b8f77" alt="MIT License"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+"></a>
+  <a href="https://github.com/fxsjy/jieba"><img src="https://img.shields.io/badge/jieba-%E4%B8%AD%E6%96%87%E5%88%86%E8%AF%8D-339933" alt="jieba 中文分词"></a>
+  <a href="https://hermes-agent.nousresearch.com/"><img src="https://img.shields.io/badge/Hermes%20Agent-plugin-111111" alt="Hermes Agent plugin"></a>
+  <a href="https://linux.do/"><img src="https://img.shields.io/badge/LINUX%20DO-Community-1f6feb" alt="LINUX DO Community"></a>
+</p>
+
 **Hermes Agent 中文记忆插件** —— 轻量、纯本地 SQLite、开箱即用的中文记忆方案。在官方 Holographic 记忆插件的基础上叠加 jieba 中文分词，让中文记忆真正"搜得到、找得准"；embedding 语义检索为**可选增强**，没有 embedding 模型也完全不影响使用。
 
 作为 Hermes 的**外部记忆提供者（L2）**运行，与内置的 MEMORY.md / USER.md（L1）**共存而非替换**。

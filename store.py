@@ -248,6 +248,15 @@ class MemoryStore:
         # Migrate: add embedding column if missing (for semantic search)
         if "embedding" not in columns:
             self._conn.execute("ALTER TABLE facts ADD COLUMN embedding BLOB")
+        # Migrate: add archived column if missing (fact archival support)
+        try:
+            cols = [r[1] for r in self._conn.execute("PRAGMA table_info(facts)")]
+            if "archived" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE facts ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+                self._conn.commit()
+        except sqlite3.OperationalError:
+            pass  # 已存在
         self._conn.commit()
 
     # ------------------------------------------------------------------
@@ -393,6 +402,7 @@ class MemoryStore:
             JOIN {fts_table} fts ON fts.rowid = f.fact_id
             WHERE {fts_table} MATCH ?
               AND f.trust_score >= ?
+              AND f.archived = 0
               {category_clause}
             ORDER BY bm25({fts_table}), f.trust_score DESC
             LIMIT ?
@@ -422,6 +432,54 @@ class MemoryStore:
             )
             self._conn.commit()
         return results
+
+    def find_fact_id(self, content: str) -> int | None:
+        """Return fact_id for exact content match, or None if not found."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT fact_id FROM facts WHERE content = ?", (content.strip(),)
+            ).fetchone()
+            return int(row["fact_id"]) if row else None
+
+    def mirror_replace(
+        self,
+        old_text: str,
+        new_content: str,
+        category: str = "general",
+    ) -> int | None:
+        """Mirror an L1 replace into L2 with merge semantics.
+
+        - old_text → new_content, no duplicate, no collision.
+        - Returns the fact_id of the surviving fact, or None if no-op.
+
+        Merge rule: when new_content already exists as a DIFFERENT fact,
+        the old fact is removed (its content is superseded) and the
+        existing fact remains.
+        """
+        old_text = old_text.strip()
+        new_content = new_content.strip()
+        if not old_text or not new_content:
+            return None
+        if old_text == new_content:
+            return self.find_fact_id(new_content)
+
+        with self._lock:
+            old_id = self.find_fact_id(old_text)
+
+            if old_id is None:
+                # old_text never mirrored — just add new content (dedup)
+                return self.add_fact(new_content, category=category)
+
+            new_id = self.find_fact_id(new_content)
+
+            if new_id is not None and new_id != old_id:
+                # new content already exists as another fact → merge
+                self.remove_fact(old_id)
+                return new_id
+
+            # safe in-place update
+            self.update_fact(old_id, content=new_content)
+            return old_id
 
     def update_fact(
         self,
@@ -481,6 +539,8 @@ class MemoryStore:
             # Recompute HRR vector if content changed
             if content is not None:
                 self._compute_hrr_vector(fact_id, content)
+                # Recompute semantic embedding so searches match new content
+                self._compute_embedding(fact_id, content)
             # Rebuild bank for relevant category
             cat = category or self._conn.execute(
                 "SELECT category FROM facts WHERE fact_id = ?", (fact_id,)
@@ -506,15 +566,99 @@ class MemoryStore:
             self._rebuild_bank(row["category"])
             return True
 
+    def consolidate_similar(self, threshold: float = 0.85) -> dict:
+        """同 category 相似事实合并：Jaccard >= threshold 且信任悬殊 >=0.15 → 删弱留强。
+
+        信任悬殊不足 0.15 时宁可不合并（避免误删仅因检索频次差异接近的条目）。
+        返回 {"merged_pairs": [{"kept", "removed", "similarity"}], "removed_ids": [...]}。
+        """
+        try:
+            from .retrieval import FactRetriever
+        except ImportError:
+            from retrieval import FactRetriever
+        merged, removed = [], []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT fact_id, content, category, trust_score, retrieval_count "
+                "FROM facts WHERE archived = 0 ORDER BY category, fact_id"
+            ).fetchall()
+            groups: dict = {}
+            for r in rows:
+                groups.setdefault(r["category"], []).append(r)
+            for items in groups.values():
+                for i in range(len(items)):
+                    if items[i]["fact_id"] in removed:
+                        continue
+                    a_tokens = FactRetriever._tokenize(items[i]["content"])
+                    for j in range(i + 1, len(items)):
+                        if items[j]["fact_id"] in removed:
+                            continue
+                        sim = FactRetriever._jaccard_similarity(
+                            a_tokens, FactRetriever._tokenize(items[j]["content"]))
+                        if sim < threshold:
+                            continue
+                        a, b = items[i], items[j]
+                        weak, strong = (
+                            (b, a)
+                            if (a["trust_score"], a["retrieval_count"])
+                            >= (b["trust_score"], b["retrieval_count"])
+                            else (a, b)
+                        )
+                        if abs(strong["trust_score"] - weak["trust_score"]) < 0.15:
+                            continue  # 悬殊不足，宁可不合并
+                        # 等价 remove_fact 的直接 SQL 删除：同一次持锁内完成，
+                        # FTS 同步由 facts_ad AFTER DELETE 触发器自动处理。
+                        self._conn.execute(
+                            "DELETE FROM fact_entities WHERE fact_id = ?",
+                            (weak["fact_id"],),
+                        )
+                        self._conn.execute(
+                            "DELETE FROM facts WHERE fact_id = ?", (weak["fact_id"],)
+                        )
+                        self._conn.commit()
+                        self._rebuild_bank(weak["category"])
+                        removed.append(weak["fact_id"])
+                        merged.append({"kept": strong["fact_id"], "removed": weak["fact_id"],
+                                       "similarity": round(sim, 3)})
+        return {"merged_pairs": merged, "removed_ids": removed}
+
+    def archive_stale(self, min_trust: float = 0.35, max_retrieval: int = 2,
+                      max_age_days: int = 90) -> dict:
+        """归档低信任低检索的陈旧事实（user_pref 例外）。返回本次 archived_ids。"""
+        cutoff = f"-{int(max_age_days)} days"
+        with self._lock:
+            ids = [r[0] for r in self._conn.execute(
+                "SELECT fact_id FROM facts WHERE archived = 0 "
+                "AND trust_score < ? AND retrieval_count <= ? "
+                "AND updated_at <= datetime('now', ?) "
+                "AND category != 'user_pref'",
+                (min_trust, max_retrieval, cutoff)).fetchall()]
+            if ids:
+                self._conn.execute(
+                    "UPDATE facts SET archived = 1 WHERE fact_id IN " + f"({','.join('?' * len(ids))})",
+                    ids)
+                self._conn.commit()
+        return {"archived_ids": ids}
+
+    def restore_archived(self, fact_id: int) -> bool:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE facts SET archived = 0 WHERE fact_id = ?", (fact_id,))
+            self._conn.commit()
+            return cur.rowcount > 0
+
     def list_facts(
         self,
         category: str | None = None,
         min_trust: float = 0.0,
         limit: int = 50,
+        archived_only: bool = False,
     ) -> list[dict]:
         """Browse facts ordered by trust_score descending.
 
         Optionally filter by category and minimum trust score.
+        archived_only=True lists only archived facts; the default lists only
+        active (non-archived) facts.
         """
         with self._lock:
             params: list = [min_trust]
@@ -522,6 +666,7 @@ class MemoryStore:
             if category is not None:
                 category_clause = "AND category = ?"
                 params.append(category)
+            archived_clause = "AND archived = 1" if archived_only else "AND archived = 0"
             params.append(limit)
 
             sql = f"""
@@ -530,6 +675,7 @@ class MemoryStore:
                 FROM facts
                 WHERE trust_score >= ?
                   {category_clause}
+                  {archived_clause}
                 ORDER BY trust_score DESC
                 LIMIT ?
             """

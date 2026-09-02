@@ -38,6 +38,9 @@ from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
+# L1 dedup：prefetch 结果与 L1（MEMORY.md/USER.md）token 重叠达到该阈值即丢弃。
+_DEDUP_THRESHOLD = 0.8
+
 
 # ---------------------------------------------------------------------------
 # Tool schemas (unchanged from original PR)
@@ -64,7 +67,7 @@ FACT_STORE_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "search", "probe", "related", "reason", "contradict", "update", "remove", "list"],
+                "enum": ["add", "search", "probe", "related", "reason", "contradict", "update", "remove", "list", "archive", "consolidate", "list_archived", "restore"],
             },
             "content": {"type": "string", "description": "Fact content (required for 'add')."},
             "query": {"type": "string", "description": "Search query (required for 'search')."},
@@ -124,6 +127,7 @@ class HermesMemoryZhProvider(MemoryProvider):
         self._config = config or _load_plugin_config()
         self._store = None
         self._retriever = None
+        self._hermes_home = ""
         self._min_trust = float(self._config.get("min_trust_threshold", 0.3))
 
     @property
@@ -158,17 +162,18 @@ class HermesMemoryZhProvider(MemoryProvider):
             {"key": "auto_extract", "description": "Auto-extract facts at session end", "default": "false", "choices": ["true", "false"]},
             {"key": "default_trust", "description": "Default trust score for new facts", "default": "0.5"},
             {"key": "hrr_dim", "description": "HRR vector dimensions", "default": "1024"},
-            {"key": "embedding_enabled", "description": "Enable semantic embedding search", "default": "true", "choices": ["true", "false"]},
+            {"key": "embedding_enabled", "description": "Enable semantic embedding search (optional, requires an OpenAI-compatible endpoint)", "default": "false", "choices": ["true", "false"]},
             {"key": "embedding_model", "description": "Embedding model name", "default": "text-embedding-v4"},
             {"key": "embedding_dim", "description": "Embedding dimension", "default": "1024"},
             {"key": "embedding_weight", "description": "Embedding scoring weight in hybrid search", "default": "0.4"},
-            {"key": "openai_base_url", "description": "Your OpenAI-compatible embeddings endpoint (e.g. DashScope compatible-mode or an AI gateway)", "default": "https://your-gateway/v1"},
+            {"key": "openai_base_url", "description": "OpenAI-compatible embeddings endpoint (e.g. DashScope compatible-mode or an AI gateway)", "default": "https://your-gateway/v1"},
             {"key": "openai_api_key", "description": "API key for the embeddings endpoint (leave empty to use env)", "default": ""},
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
         from hermes_constants import get_hermes_home
         _hermes_home = str(get_hermes_home())
+        self._hermes_home = _hermes_home
         _default_db = _hermes_home + "/memory_store.db"
         db_path = self._config.get("db_path", _default_db)
         # Expand $HERMES_HOME in user-supplied paths so config values like
@@ -182,15 +187,18 @@ class HermesMemoryZhProvider(MemoryProvider):
         hrr_weight = float(self._config.get("hrr_weight", 0.3))
         temporal_decay = int(self._config.get("temporal_decay_half_life", 0))
 
-        # Semantic embedding — OpenAI-compatible gateway (e.g. DashScope / an AI gateway).
-        embedding_enabled = is_truthy_value(self._config.get("embedding_enabled", True))
+        # Semantic embedding — OPTIONAL enhancement. The plugin is fully usable
+        # without it (jieba + FTS5 + HRR hybrid search works offline, pure local
+        # SQLite). Enable only when you have an OpenAI-compatible embeddings
+        # endpoint (e.g. DashScope compatible-mode or your own AI gateway).
+        embedding_enabled = is_truthy_value(self._config.get("embedding_enabled", False))
         embedding_model = self._config.get("embedding_model", "text-embedding-v4")
         embedding_dim = int(self._config.get("embedding_dim", 1024))
         embedding_weight = float(self._config.get("embedding_weight", 0.4))
         embedding_api_key = (
             self._config.get("openai_api_key")
-            or os.environ.get("DASHSCOPE_API_KEY", "")
             or os.environ.get("OPENAI_API_KEY", "")
+            or os.environ.get("DASHSCOPE_API_KEY", "")
         )
         embedding_base_url = self._config.get("openai_base_url", "https://your-gateway/v1")
 
@@ -236,9 +244,13 @@ class HermesMemoryZhProvider(MemoryProvider):
                 "Use fact_feedback to rate facts after using them (trains trust scores)."
             )
         return (
-            f"# Holographic Memory\n"
+            f"# Holographic Memory (hermes-memory-zh)\n"
             f"Active. {total} facts stored with entity resolution and trust scoring.\n"
-            f"Use fact_store to search, probe entities, reason across entities, or add facts.\n"
+            f"Write channels: L1 mirror (memory tool add/replace auto-syncs to L2) "
+            f"+ fact_store(add) for structured facts beyond L1.\n"
+            f"Read: prefetch per-turn recall + fact_store search/probe/reason/related/contradict.\n"
+            f"Use fact_store(action='add') when the user states a durable preference, "
+            f"decision, or fact that is worth querying across sessions.\n"
             f"Use fact_feedback to rate facts after using them (trains trust scores)."
         )
 
@@ -247,6 +259,18 @@ class HermesMemoryZhProvider(MemoryProvider):
             return ""
         try:
             results = self._retriever.search(query, min_trust=self._min_trust, limit=5)
+            if not results:
+                return ""
+            try:
+                from .l1_baseline import build_baseline, is_duplicate
+                from .retrieval import FactRetriever
+                baseline = build_baseline(self._hermes_home + "/memories")
+                if baseline:
+                    results = [r for r in results
+                               if not is_duplicate(FactRetriever._tokenize(r.get("content", "")),
+                                                   baseline, _DEDUP_THRESHOLD)]
+            except Exception as e:
+                logger.debug("L1 dedup skipped (non-fatal): %s", e)
             if not results:
                 return ""
             lines = []
@@ -283,14 +307,36 @@ class HermesMemoryZhProvider(MemoryProvider):
             return
         self._auto_extract_facts(messages)
 
-    def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror built-in memory writes as facts."""
-        if action == "add" and self._store and content:
-            try:
-                category = "user_pref" if target == "user" else "general"
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: dict | None = None,
+    ) -> None:
+        """Mirror built-in memory writes as facts (archive mirroring).
+
+        - add     → new fact in L2
+        - replace → update the L2 fact matching old_text to the new content
+        - remove  → deliberately NO-OP: L1 removal is usually due to the char
+                    cap, not staleness. Stale facts are pruned explicitly via
+                    fact_store(action='remove') during hermes-governance runs.
+        """
+        if not self._store:
+            return
+        category = "user_pref" if target == "user" else "general"
+        try:
+            if action == "add" and content:
                 self._store.add_fact(content, category=category)
-            except Exception as e:
-                logger.debug("Holographic memory_write mirror failed: %s", e)
+            elif action == "replace":
+                old_text = (metadata or {}).get("old_text", "")
+                if old_text and content:
+                    self._store.mirror_replace(old_text, content, category)
+                elif content:
+                    self._store.add_fact(content, category=category)
+            # action == "remove": archive mirroring keeps the L2 fact.
+        except Exception as e:
+            logger.debug("Holographic memory_write mirror failed: %s", e)
 
     def shutdown(self) -> None:
         # Release the shared SQLite connection deterministically on the
@@ -387,6 +433,22 @@ class HermesMemoryZhProvider(MemoryProvider):
                     limit=int(args.get("limit", 10)),
                 )
                 return json.dumps({"facts": facts, "count": len(facts)})
+
+            elif action == "consolidate":
+                return json.dumps(store.consolidate_similar(threshold=float(args.get("threshold", 0.85))))
+
+            elif action == "archive":
+                return json.dumps(store.archive_stale(
+                    min_trust=float(args.get("min_trust", 0.35)),
+                    max_retrieval=int(args.get("max_retrieval", 2)),
+                    max_age_days=int(args.get("max_age_days", 90))))
+
+            elif action == "list_archived":
+                facts = store.list_facts(archived_only=True, limit=int(args.get("limit", 50)))
+                return json.dumps({"facts": facts, "count": len(facts)})
+
+            elif action == "restore":
+                return json.dumps({"restored": store.restore_archived(int(args["fact_id"]))})
 
             else:
                 return tool_error(f"Unknown action: {action}")

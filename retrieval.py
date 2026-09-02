@@ -12,6 +12,7 @@ Jaccard similarity reranking and trust-weighted scoring.
 from __future__ import annotations
 
 import math
+import re as _re
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -209,7 +210,7 @@ class FactRetriever:
                 )
 
         # Score against individual fact vectors directly
-        where = "WHERE hrr_vector IS NOT NULL"
+        where = "WHERE hrr_vector IS NOT NULL AND archived = 0"
         params: list = []
         if category:
             where += " AND category = ?"
@@ -271,7 +272,7 @@ class FactRetriever:
         entity_vec = hrr.encode_atom(entity.lower(), self.hrr_dim)
 
         # Get all facts with vectors
-        where = "WHERE hrr_vector IS NOT NULL"
+        where = "WHERE hrr_vector IS NOT NULL AND archived = 0"
         params: list = []
         if category:
             where += " AND category = ?"
@@ -352,7 +353,7 @@ class FactRetriever:
             entity_residuals.append(probe_key)
 
         # Get all facts with vectors
-        where = "WHERE hrr_vector IS NOT NULL"
+        where = "WHERE hrr_vector IS NOT NULL AND archived = 0"
         params: list = []
         if category:
             where += " AND category = ?"
@@ -417,7 +418,7 @@ class FactRetriever:
         conn = self.store._conn
 
         # Get all facts with vectors and their linked entities
-        where = "WHERE f.hrr_vector IS NOT NULL"
+        where = "WHERE f.hrr_vector IS NOT NULL AND f.archived = 0"
         params: list = []
         if category:
             where += " AND f.category = ?"
@@ -511,7 +512,7 @@ class FactRetriever:
         """Score facts by similarity to a target vector."""
         conn = self.store._conn
 
-        where = "WHERE hrr_vector IS NOT NULL"
+        where = "WHERE hrr_vector IS NOT NULL AND archived = 0"
         params: list = []
         if category:
             where += " AND category = ?"
@@ -561,19 +562,20 @@ class FactRetriever:
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
-        """Simple whitespace tokenization with lowercasing.
-
-        Strips common punctuation. No stemming/lemmatization (Phase 1).
-        """
+        """jieba for Chinese, whitespace split for English fallback."""
         if not text:
             return set()
-        # Split on whitespace, lowercase, strip punctuation
-        tokens = set()
-        for word in text.lower().split():
-            cleaned = word.strip(".,;:!?\"'()[]{}#@<>")
-            if cleaned:
-                tokens.add(cleaned)
-        return tokens
+        _PUNCT = _re.compile(r"[.,;:!?\"'()\[\]{}#@<>/\-§|*]+")
+        _clean = lambda t: _PUNCT.sub("", t).strip()
+        try:
+            import jieba
+            return {_clean(t) for t in jieba.cut(text) if _clean(t)}
+        except Exception:
+            tokens = {_clean(w) for w in text.lower().split() if _clean(w)}
+            s = text.replace(" ", "")
+            if len(s) > 1:
+                tokens.update(s[i:i+2] for i in range(len(s) - 1))
+            return tokens
 
     # Stopwords dropped before FTS5 OR-expansion. Short English function
     # words that carry no retrieval signal and force false-negative AND

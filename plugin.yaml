@@ -1,5 +1,5 @@
 name: hermes-memory-zh
-version: 0.1.0
-description: "Chinese semantic memory provider for Hermes Agent — jieba tokenization + embedding via an OpenAI-compatible gateway. Fork of official holographic memory plugin."
+version: 0.2.0
+description: "Chinese semantic memory provider for Hermes Agent — jieba tokenization + bge-m3 embedding via OpenAI-compatible gateway. Fork of official holographic memory plugin."
 hooks:
   - on_session_end

@@ -27,6 +27,8 @@ Hermes 内置的 Holographic 记忆插件用 SQLite FTS5 全文检索，但 FTS5
 - ✅ **config 全驱动** —— base_url / model / dim / weight 全部可配，零硬编码
 - ✅ **独立插件** —— 装到 `~/.hermes/plugins/`，`hermes update` 不覆盖
 - ✅ **与 L1 共存** —— MEMORY.md 继续每轮注入，本插件作为检索式 L2 叠加
+- ✅ **prefetch L1 去重（v0.2.0）** —— 召回注入前以 L1 条目为已见基线（jieba Jaccard ≥0.8 判重），只注入增量事实，消除 L1 已常驻又被重复注入的 token 浪费；失败自动降级全量注入
+- ✅ **写侧压缩归档（v0.2.0，手动触发）** —— `fact_store` 新增 4 动作：`consolidate`（相似事实合并，Jaccard≥0.85 且信任悬殊≥0.15 删弱留强）/ `archive`（低信任低检索陈旧事实打标记不删除，全部检索路径自动过滤）/ `list_archived` / `restore`（反归档）
 - ✅ **MIT 许可** —— 继承官方，含完整版权声明
 
 ## 与官方方案的对比
@@ -44,7 +46,7 @@ Hermes 内置的 Holographic 记忆插件用 SQLite FTS5 全文检索，但 FTS5
 
 ```bash
 # 从 Git 仓库安装（发布后）
-hermes plugins install <owner>/hermes-memory-zh --enable
+hermes plugins install blacksamuraiiii/hermes-memory-zh --enable
 
 # 或手动放到插件目录
 mkdir -p ~/.hermes/plugins/hermes-memory-zh
@@ -59,6 +61,16 @@ pip install jieba
 
 重启 Hermes（`/restart` 或 `hermes gateway restart`），`hermes memory status` 确认插件已激活。
 
+## 运行测试
+
+```bash
+# 使用 hermes 自带 venv（含 jieba/openai/numpy 依赖）
+~/.hermes/hermes-agent/venv/bin/python -m pytest tests/ \
+  PYTHONPATH=~/.hermes/hermes-agent
+```
+
+> 测试依赖 Hermes core 模块（`hermes_state_registry` 等），需将 `PYTHONPATH` 指向 hermes-agent 安装/源码目录；测试数据全部为中性示例，不依赖任何真实环境。
+
 > 记忆按 L1/L2 分层：内置 MEMORY.md / USER.md 继续每轮注入，本插件作为 L2 提供大规模事实的语义检索，两者不冲突。
 
 ## 配置
@@ -69,7 +81,7 @@ pip install jieba
 plugins:
   hermes-memory-zh:
     db_path: ~/.hermes/memory_store.db
-    auto_extract: true
+    auto_extract: false  # 默认关闭：内置英文正则对中文失效，开着零产出；日常以 L1 镜像为主通道
     default_trust: 0.5
     hrr_dim: 1024
     # —— 中文分词（装 jieba 即自动启用）——
@@ -98,11 +110,45 @@ plugins:
 
 > ⚠️ 换模型即换向量空间：新旧 embedding 不可混用，切换后请对已有 facts 重新生成向量。
 
+## 数据流架构
+
+记忆写入有三条通道，读取有两条路径：**L1（MEMORY.md / USER.md 策展文件）是人工策展的事实源，L2（SQLite 事实库）是机器检索的事实库**。日常通过 `memory` 工具写 L1，会自动镜像到 L2；两条读取路径互不干扰，各取所长。
+
+```
+         ┌─────────── 写入侧 ───────────┐
+通道A   │ memory 工具写L1 → 自动镜像L2  │   add: 新增 / replace: 原地替换(撞车合并)
+         │ remove: 存档保留(容量不够≠过时)│   ← 主通道，日常用 memory 就自动走
+通道B   │ auto_extract: 会话结束扫消息  │   默认关闭(英文正则对中文失效)
+通道C   │ fact_store(add): agent主动存  │   结构化事实、偏好、决策，需跨会话查询
+         └──────────────────────────────┘
+                        │
+                        ▼
+              L2 memory_store.db (SQLite)
+           (content_tokens / embedding / trust)
+                        │
+                        ▼
+         ┌─────────── 读取侧 ───────────┐
+         │ prefetch: 每轮自动召回 top5   │  jieba分词 + embedding语义
+         │   └ L1 去重基线(v0.2.0):     │  与L1条目Jaccard≥0.8判重跳过
+         │      只注入L1没有的增量       │  失败降级全量注入
+         │ fact_store: 深查/推理/矛盾检测 │  search/probe/reason/related/contradict
+         │ fact_store: 压缩/归档(v0.2.0) │  consolidate/archive/list_archived/restore
+         └──────────────────────────────┘
+```
+
+### 三通道契约
+
+- **通道A（L1 镜像）**：`memory` 工具 `add` / `replace` 自动同步到 L2，`remove` 存档保留（容量不够 ≠ 过时）。`replace` 采用 `mirror_replace` 三路合并——正常替换 → 原地更新；撞车（新内容已存在）→ 删旧留新；旧内容未镜像 → 直接添加。这是主通道，日常用 `memory` 就自动走，无需任何额外配置。
+- **通道B（auto_extract）**：默认关闭。内置英文正则对中文无效，开着零产出；若后续需要，可上 LLM 提取方案。
+- **通道C（fact_store add）**：agent 主动判断值得沉淀的结构化事实、偏好、决策，直接写入 L2，供跨会话深度查询。
+
 ## 原理
 
 ```
-写入：中文内容 → jieba 分词 → 存入 facts.content_tokens
-      → 生成 embedding 向量 → 存入 facts.embedding
+写入：内容变化 → jieba 分词 → 重算 facts.content_tokens
+      → 重算 HRR 向量 → 重算 embedding 向量 → 更新 facts.embedding
+      （update_fact 必须三样一起重算：content_tokens / HRR / embedding，
+        否则改内容后旧向量不匹配新语义，检索失效——这是已修复的 bug）
 
 检索：中文查询 → jieba 分词
       → Step1 tokenized AND（全词命中，最精确）

@@ -5,9 +5,9 @@
 # Copyright (c) Nous Research. See LICENSE.
 """OpenAI-compatible embedding client for semantic retrieval.
 
-Pointed at any OpenAI-compatible /v1/embeddings endpoint — configure `base_url`
-to your gateway (e.g. DashScope compatible-mode or an internal AI gateway) and
-pick a model like `text-embedding-v4` (1024-dim) or `bge-m3` (1024-dim).
+Pointed at any OpenAI-compatible /v1/embeddings endpoint — by default your configured
+gateway with the `text-embedding-v4` multilingual model
+(1024-dim). Works with text-embedding-* models too by changing `model` / `dim`.
 
 Fully optional: if no API key is configured, or any call fails, `embed` returns
 None and retrieval degrades to pure keyword/HRR search — it never raises.
